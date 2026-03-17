@@ -23,6 +23,7 @@ LIST_FIELDS = {f["key"] for f in FIELDS if f["type"] == "list"}
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def get_gemini_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -33,6 +34,7 @@ def get_gemini_client():
 
 def clean_json(text: str) -> str:
     import re
+
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"\s*```", "", text)
     text = re.sub(r",\s*([}\]])", r"\1", text)
@@ -45,9 +47,7 @@ def load_all_interviews() -> pd.DataFrame:
 
 def load_interview(interview_id: int) -> dict | None:
     with database.get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM interviews WHERE id = ?", (interview_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM interviews WHERE id = ?", (interview_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -61,9 +61,7 @@ def load_syntheses() -> list[dict]:
 
 def load_synthesis_content(synthesis_id: int) -> str:
     with database.get_connection() as conn:
-        row = conn.execute(
-            "SELECT content FROM syntheses WHERE id = ?", (synthesis_id,)
-        ).fetchone()
+        row = conn.execute("SELECT content FROM syntheses WHERE id = ?", (synthesis_id,)).fetchone()
     return row["content"] if row else ""
 
 
@@ -82,6 +80,7 @@ def expand_list_field(df: pd.DataFrame, col: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
+
 
 def view_macro_dashboard(df: pd.DataFrame) -> None:
     st.header("Macro Dashboard")
@@ -108,16 +107,26 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
         if "gender" in df.columns:
             gc = df["gender"].value_counts().reset_index()
             gc.columns = ["gender", "count"]
-            fig = px.pie(gc, names="gender", values="count", title="Gender Split",
-                         color_discrete_sequence=px.colors.qualitative.Set2)
+            fig = px.pie(
+                gc,
+                names="gender",
+                values="count",
+                title="Gender Split",
+                color_discrete_sequence=px.colors.qualitative.Set2,
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     with row1_r:
         if "monthly_income_range" in df.columns:
             ic = df["monthly_income_range"].value_counts().reset_index()
             ic.columns = ["range", "count"]
-            fig = px.bar(ic, x="range", y="count", title="Monthly Income Distribution",
-                         color_discrete_sequence=["#4C8BF5"])
+            fig = px.bar(
+                ic,
+                x="range",
+                y="count",
+                title="Monthly Income Distribution",
+                color_discrete_sequence=["#4C8BF5"],
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     row2_l, row2_r = st.columns(2)
@@ -126,20 +135,30 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
         items = expand_list_field(df, "loan_apps_used")
         if items:
             from collections import Counter
+
             counts = Counter(items).most_common(10)
             ldf = pd.DataFrame(counts, columns=["app", "count"])
-            fig = px.bar(ldf, y="app", x="count", orientation="h",
-                         title="Top Loan Apps Used",
-                         color_discrete_sequence=["#36A2EB"])
+            fig = px.bar(
+                ldf,
+                y="app",
+                x="count",
+                orientation="h",
+                title="Top Loan Apps Used",
+                color_discrete_sequence=["#36A2EB"],
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     with row2_r:
         if "interest_vs_fee_pref" in df.columns:
             pc = df["interest_vs_fee_pref"].value_counts().reset_index()
             pc.columns = ["pref", "count"]
-            fig = px.pie(pc, names="pref", values="count",
-                         title="Interest vs Upfront Fee Preference",
-                         color_discrete_sequence=px.colors.qualitative.Pastel)
+            fig = px.pie(
+                pc,
+                names="pref",
+                values="count",
+                title="Interest vs Upfront Fee Preference",
+                color_discrete_sequence=px.colors.qualitative.Pastel,
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     row3_l, row3_r = st.columns(2)
@@ -148,16 +167,26 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
         if "preferred_tenure" in df.columns:
             tc = df["preferred_tenure"].value_counts().reset_index()
             tc.columns = ["tenure", "count"]
-            fig = px.bar(tc, x="tenure", y="count", title="Preferred Loan Tenure",
-                         color_discrete_sequence=["#FF6384"])
+            fig = px.bar(
+                tc,
+                x="tenure",
+                y="count",
+                title="Preferred Loan Tenure",
+                color_discrete_sequence=["#FF6384"],
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     with row3_r:
         if "preferred_amount_range" in df.columns:
             ac = df["preferred_amount_range"].value_counts().reset_index()
             ac.columns = ["range", "count"]
-            fig = px.bar(ac, x="range", y="count", title="Preferred Loan Amount Range",
-                         color_discrete_sequence=["#FFCE56"])
+            fig = px.bar(
+                ac,
+                x="range",
+                y="count",
+                title="Preferred Loan Amount Range",
+                color_discrete_sequence=["#FFCE56"],
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
@@ -181,9 +210,7 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
         )
         with st.spinner("Generating personas and synthesis…"):
             try:
-                response = client.models.generate_content(
-                    model="gemini-1.5-pro", contents=prompt
-                )
+                response = client.models.generate_content(model="gemini-1.5-pro", contents=prompt)
                 content = response.text
                 now = datetime.now(timezone.utc).isoformat()
                 with database.get_connection() as conn:
@@ -216,8 +243,16 @@ def view_directory(df: pd.DataFrame) -> None:
         st.info("No interviews found.")
         return
 
-    display_cols = ["id", "source_file", "respondent_name", "age", "gender",
-                    "location", "needs_reprocessing", "created_at"]
+    display_cols = [
+        "id",
+        "source_file",
+        "respondent_name",
+        "age",
+        "gender",
+        "location",
+        "needs_reprocessing",
+        "created_at",
+    ]
     display_cols = [c for c in display_cols if c in df.columns]
     display_df = df[display_cols].copy()
 
@@ -296,8 +331,11 @@ def view_detail(interview_id: int) -> None:
         if reextract_key not in st.session_state:
             st.session_state[reextract_key] = False
 
-        if st.button("Re-Extract Insights", key=f"reextract_{interview_id}",
-                     disabled=st.session_state[reextract_key]):
+        if st.button(
+            "Re-Extract Insights",
+            key=f"reextract_{interview_id}",
+            disabled=st.session_state[reextract_key],
+        ):
             st.session_state[reextract_key] = True
             client = get_gemini_client()
 
@@ -354,6 +392,7 @@ def view_detail(interview_id: int) -> None:
 # Auth
 # ---------------------------------------------------------------------------
 
+
 def _render_login() -> None:
     _, col, _ = st.columns([1, 2, 1])
     with col:
@@ -377,6 +416,7 @@ def _render_login() -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     st.set_page_config(page_title="PDUx Research Synthesizer", layout="wide")
     database.init_db()
@@ -395,9 +435,7 @@ def main() -> None:
         st.session_state["view"] = st.radio(
             "Navigate",
             ["Macro Dashboard", "Directory", "Detail & Edit"],
-            index=["Macro Dashboard", "Directory", "Detail & Edit"].index(
-                st.session_state["view"]
-            ),
+            index=["Macro Dashboard", "Directory", "Detail & Edit"].index(st.session_state["view"]),
         )
 
     df = load_all_interviews()

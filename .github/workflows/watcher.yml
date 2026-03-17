@@ -25,6 +25,19 @@ jobs:
           pip install -r requirements.txt
           pip install --force-reinstall google-genai==1.67.0
 
+      - name: Verify SDK API
+        run: |
+          pip show google-genai
+          python - <<'EOF'
+          from google import genai
+          import inspect
+          sig = inspect.signature(genai.client.Files.upload)
+          params = list(sig.parameters.keys())
+          print("files.upload params:", params)
+          assert "file" in params, f"SDK API mismatch — expected 'file=' param, got: {params}"
+          print("SDK API verified OK")
+          EOF
+
       - name: Run watcher (one-shot)
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}

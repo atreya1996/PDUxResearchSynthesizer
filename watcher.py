@@ -1,5 +1,4 @@
 import argparse
-import io
 import json
 import logging
 import mimetypes
@@ -10,10 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from google import genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from google import genai
 
 import database
 
@@ -41,6 +40,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 def _load_env() -> dict:
     required = [
@@ -83,6 +83,7 @@ def build_prompt(schema: dict) -> str:
 # Retry / backoff
 # ---------------------------------------------------------------------------
 
+
 def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.0, **kwargs):
     last_exc = None
     for attempt in range(max_retries):
@@ -90,8 +91,14 @@ def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.
             return func(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            delay = base_delay * (2 ** attempt)
-            log.warning("Attempt %d/%d failed (%s). Retrying in %.1fs…", attempt + 1, max_retries, exc, delay)
+            delay = base_delay * (2**attempt)
+            log.warning(
+                "Attempt %d/%d failed (%s). Retrying in %.1fs…",
+                attempt + 1,
+                max_retries,
+                exc,
+                delay,
+            )
             time.sleep(delay)
     raise last_exc
 
@@ -99,6 +106,7 @@ def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.
 # ---------------------------------------------------------------------------
 # Google Drive helpers
 # ---------------------------------------------------------------------------
+
 
 def _build_drive_service(config: dict):
     sa_value = config["GOOGLE_SERVICE_ACCOUNT_JSON"]
@@ -118,9 +126,7 @@ def list_inbox_files(drive_service, inbox_folder_id: str) -> list:
         "and mimeType != 'application/vnd.google-apps.folder'"
     )
     result = retry_with_backoff(
-        drive_service.files().list(
-            q=query, fields="files(id, name, mimeType)"
-        ).execute
+        drive_service.files().list(q=query, fields="files(id, name, mimeType)").execute
     )
     return result.get("files", [])
 
@@ -138,18 +144,21 @@ def download_file(drive_service, file_id: str, file_name: str) -> Path:
 
 def move_to_archive(drive_service, file_id: str, inbox_id: str, archive_id: str) -> None:
     retry_with_backoff(
-        drive_service.files().update(
+        drive_service.files()
+        .update(
             fileId=file_id,
             addParents=archive_id,
             removeParents=inbox_id,
             fields="id, parents",
-        ).execute
+        )
+        .execute
     )
 
 
 # ---------------------------------------------------------------------------
 # JSON helpers
 # ---------------------------------------------------------------------------
+
 
 def clean_json(text: str) -> str:
     text = re.sub(r"```json\s*", "", text)
@@ -161,6 +170,7 @@ def clean_json(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
+
 
 def detect_mime_type(file_path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(file_path))
@@ -185,17 +195,19 @@ def process_file(
     log.info("[DOWNLOADED] %s (%.1f MB, %s)", file_name, size_mb, mime_type)
 
     uploaded = retry_with_backoff(
-        gemini_client.files.upload,
-        file=str(local_path),
-        config={"mime_type": mime_type},
+        lambda: gemini_client.files.upload(
+            file=str(local_path),
+            config={"mime_type": mime_type},
+        )
     )
     log.info("[UPLOADED TO GEMINI] %s -> %s", file_name, uploaded.name)
 
     try:
         response = retry_with_backoff(
-            gemini_client.models.generate_content,
-            model="gemini-1.5-pro",
-            contents=[uploaded, prompt],
+            lambda: gemini_client.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=[uploaded, prompt],
+            )
         )
         raw = response.text
         data = json.loads(clean_json(raw))
@@ -242,6 +254,7 @@ def process_file(
 # Watcher loop
 # ---------------------------------------------------------------------------
 
+
 def _write_gha_summary(total: int, succeeded: int, failed: list) -> None:
     """Write a markdown summary to the GitHub Actions job summary page."""
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -249,8 +262,8 @@ def _write_gha_summary(total: int, succeeded: int, failed: list) -> None:
         return
     lines = [
         "## Watcher Run Summary\n",
-        f"| | Count |",
-        f"|---|---|",
+        "| | Count |",
+        "|---|---|",
         f"| Total files found | {total} |",
         f"| Processed successfully | {succeeded} |",
         f"| Failed | {len(failed)} |",
@@ -263,7 +276,9 @@ def _write_gha_summary(total: int, succeeded: int, failed: list) -> None:
         f.write("\n".join(lines))
 
 
-def run_watcher(drive_service, gemini_client, schema: dict, config: dict, once: bool = False) -> int:
+def run_watcher(
+    drive_service, gemini_client, schema: dict, config: dict, once: bool = False
+) -> int:
     """Returns exit code: 0 if all files processed, 1 if any failed."""
     prompt = build_prompt(schema)
     if once:
@@ -302,7 +317,9 @@ def run_watcher(drive_service, gemini_client, schema: dict, config: dict, once: 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Process inbox once and exit (for cron/CI use)")
+    parser.add_argument(
+        "--once", action="store_true", help="Process inbox once and exit (for cron/CI use)"
+    )
     args = parser.parse_args()
 
     cfg = _load_env()
