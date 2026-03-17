@@ -31,3 +31,11 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python watcher.py --once
+
+      - name: Upload watcher logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watcher-logs-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
