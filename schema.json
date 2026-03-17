@@ -1,0 +1,20 @@
+{
+  "fields": [
+    { "key": "respondent_name",        "label": "Respondent Name",                         "type": "text",    "sql": "TEXT" },
+    { "key": "age",                    "label": "Age",                                     "type": "number",  "sql": "INTEGER" },
+    { "key": "gender",                 "label": "Gender",                                  "type": "text",    "sql": "TEXT" },
+    { "key": "location",               "label": "Location / City",                         "type": "text",    "sql": "TEXT" },
+    { "key": "occupation",             "label": "Occupation / Livelihood",                 "type": "text",    "sql": "TEXT" },
+    { "key": "monthly_income_range",   "label": "Monthly Income Range (INR)",              "type": "text",    "sql": "TEXT" },
+    { "key": "has_bank_account",       "label": "Has Bank Account",                        "type": "boolean", "sql": "INTEGER" },
+    { "key": "has_pan_card",           "label": "Has PAN Card",                            "type": "boolean", "sql": "INTEGER" },
+    { "key": "other_cards",            "label": "Other Cards Held",                        "type": "list",    "sql": "TEXT" },
+    { "key": "loan_apps_used",         "label": "Loan Apps Used",                          "type": "list",    "sql": "TEXT" },
+    { "key": "openness_to_loans",      "label": "Openness to Loan Categories",             "type": "text",    "sql": "TEXT" },
+    { "key": "preferred_tenure",       "label": "Preferred Loan Tenure",                  "type": "text",    "sql": "TEXT" },
+    { "key": "preferred_amount_range", "label": "Preferred Loan Amount Range",             "type": "text",    "sql": "TEXT" },
+    { "key": "interest_vs_fee_pref",   "label": "Standard Interest vs Upfront Fee Pref",  "type": "text",    "sql": "TEXT" },
+    { "key": "key_insights",           "label": "Key Insights (3-5 bullets)",              "type": "list",    "sql": "TEXT" },
+    { "key": "persona_tags",           "label": "Suggested Persona Tags",                 "type": "list",    "sql": "TEXT" }
+  ]
+}
