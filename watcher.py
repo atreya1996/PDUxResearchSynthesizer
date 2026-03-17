@@ -1,4 +1,6 @@
 import argparse
+import importlib.metadata
+import inspect
 import json
 import logging
 import mimetypes
@@ -17,6 +19,9 @@ from googleapiclient.http import MediaIoBaseDownload
 import database
 
 load_dotenv()
+
+# Log SDK version immediately so every run's artifact is self-contained.
+_GENAI_VERSION = importlib.metadata.version("google-genai")
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 POLL_INTERVAL_SECONDS = 60
@@ -168,6 +173,48 @@ def clean_json(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Gemini helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_gemini_client(client) -> None:
+    """Log SDK version and assert the files.upload API is what we expect.
+
+    This runs once at startup and surfaces version mismatches immediately,
+    before any file is downloaded from Drive.
+    """
+    log.info("google-genai SDK version: %s", _GENAI_VERSION)
+    sig = inspect.signature(client.files.upload)
+    params = list(sig.parameters.keys())
+    log.info("files.upload() parameters: %s", params)
+    if "file" not in params and "path" not in params:
+        raise RuntimeError(
+            f"Unrecognised files.upload() signature {sig}. "
+            "Pin google-genai to a known version in requirements.txt."
+        )
+
+
+def _gemini_upload(client, local_path: Path, mime_type: str):
+    """Upload a local file to Gemini Files API.
+
+    Detects the parameter name at runtime so the code works regardless of
+    which google-genai version is installed:
+      - >= 1.0:  files.upload(file=..., config={"mime_type": ...})
+      - == 0.5:  files.upload(path=..., config={"mime_type": ...})
+    """
+    sig = inspect.signature(client.files.upload)
+    if "file" in sig.parameters:
+        return client.files.upload(file=str(local_path), config={"mime_type": mime_type})
+    # Fallback: old SDK (google-genai 0.x) used path= instead of file=
+    log.warning(
+        "Falling back to legacy files.upload(path=) API "
+        "(google-genai %s). Upgrade to >=1.0 or pin to ==1.67.0.",
+        _GENAI_VERSION,
+    )
+    return client.files.upload(path=str(local_path), config={"mime_type": mime_type})
+
+
+# ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
 
@@ -194,12 +241,7 @@ def process_file(
     mime_type = detect_mime_type(local_path)
     log.info("[DOWNLOADED] %s (%.1f MB, %s)", file_name, size_mb, mime_type)
 
-    uploaded = retry_with_backoff(
-        lambda: gemini_client.files.upload(
-            file=str(local_path),
-            config={"mime_type": mime_type},
-        )
-    )
+    uploaded = retry_with_backoff(lambda: _gemini_upload(gemini_client, local_path, mime_type))
     log.info("[UPLOADED TO GEMINI] %s -> %s", file_name, uploaded.name)
 
     try:
@@ -328,6 +370,9 @@ if __name__ == "__main__":
 
     drive_svc = _build_drive_service(cfg)
     gemini_client = genai.Client(api_key=cfg["GEMINI_API_KEY"])
+
+    # Validate SDK contract before touching any files — surfaces mismatches immediately.
+    _validate_gemini_client(gemini_client)
 
     exit_code = run_watcher(drive_svc, gemini_client, schema, cfg, once=args.once)
     raise SystemExit(exit_code)
