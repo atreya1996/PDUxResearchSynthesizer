@@ -178,7 +178,7 @@ def process_file(
 
     uploaded = retry_with_backoff(
         gemini_client.files.upload,
-        path=str(local_path),
+        file=str(local_path),
         config={"mime_type": mime_type},
     )
 
