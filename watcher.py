@@ -19,17 +19,23 @@ import database
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger(__name__)
-
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 POLL_INTERVAL_SECONDS = 60
 SCHEMA_PATH = Path(__file__).parent / "schema.json"
 TMP_DIR = Path(__file__).parent / "tmp"
 TMP_DIR.mkdir(exist_ok=True)
+LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOGS_DIR / "watcher.log"),
+    ],
+)
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -171,16 +177,19 @@ def process_file(
 ) -> None:
     file_id = drive_file["id"]
     file_name = drive_file["name"]
-    log.info("Processing: %s", file_name)
+    log.info("[START] %s", file_name)
 
     local_path = download_file(drive_service, file_id, file_name)
+    size_mb = local_path.stat().st_size / (1024 * 1024)
     mime_type = detect_mime_type(local_path)
+    log.info("[DOWNLOADED] %s (%.1f MB, %s)", file_name, size_mb, mime_type)
 
     uploaded = retry_with_backoff(
         gemini_client.files.upload,
         file=str(local_path),
         config={"mime_type": mime_type},
     )
+    log.info("[UPLOADED TO GEMINI] %s -> %s", file_name, uploaded.name)
 
     try:
         response = retry_with_backoff(
@@ -190,12 +199,13 @@ def process_file(
         )
         raw = response.text
         data = json.loads(clean_json(raw))
+        log.info("[TRANSCRIBED] %s (%d chars)", file_name, len(raw))
     finally:
         try:
             gemini_client.files.delete(name=uploaded.name)
-            log.info("Deleted Gemini file: %s", uploaded.name)
+            log.info("[GEMINI CLEANUP] Deleted %s", uploaded.name)
         except Exception as exc:
-            log.warning("Could not delete Gemini file %s: %s", uploaded.name, exc)
+            log.warning("[GEMINI CLEANUP] Could not delete %s: %s", uploaded.name, exc)
 
     # Serialize list fields
     for field in schema["fields"]:
@@ -219,39 +229,71 @@ def process_file(
             values,
         )
         conn.commit()
-    log.info("Saved interview for: %s", file_name)
+    log.info("[SAVED TO DB] %s", file_name)
 
     move_to_archive(drive_service, file_id, config["INBOX_FOLDER_ID"], config["ARCHIVE_FOLDER_ID"])
-    log.info("Archived Drive file: %s", file_name)
+    log.info("[ARCHIVED] %s", file_name)
 
     local_path.unlink(missing_ok=True)
+    log.info("[DONE] %s", file_name)
 
 
 # ---------------------------------------------------------------------------
 # Watcher loop
 # ---------------------------------------------------------------------------
 
-def run_watcher(drive_service, gemini_client, schema: dict, config: dict, once: bool = False) -> None:
+def _write_gha_summary(total: int, succeeded: int, failed: list) -> None:
+    """Write a markdown summary to the GitHub Actions job summary page."""
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    lines = [
+        "## Watcher Run Summary\n",
+        f"| | Count |",
+        f"|---|---|",
+        f"| Total files found | {total} |",
+        f"| Processed successfully | {succeeded} |",
+        f"| Failed | {len(failed)} |",
+    ]
+    if failed:
+        lines.append("\n### Failed files")
+        for name, err in failed:
+            lines.append(f"- `{name}`: {err}")
+    with open(summary_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def run_watcher(drive_service, gemini_client, schema: dict, config: dict, once: bool = False) -> int:
+    """Returns exit code: 0 if all files processed, 1 if any failed."""
     prompt = build_prompt(schema)
     if once:
         log.info("Watcher running in one-shot mode.")
     else:
         log.info("Watcher started. Polling every %ds.", POLL_INTERVAL_SECONDS)
     while True:
+        succeeded = 0
+        failed = []
         try:
             files = list_inbox_files(drive_service, config["INBOX_FOLDER_ID"])
             log.info("Found %d file(s) in inbox.", len(files))
             for drive_file in files:
                 try:
                     process_file(drive_service, drive_file, gemini_client, schema, config, prompt)
+                    succeeded += 1
                 except Exception as exc:
-                    log.error("Failed to process %s: %s", drive_file.get("name"), exc, exc_info=True)
+                    log.error("[FAILED] %s: %s", drive_file.get("name"), exc, exc_info=True)
+                    failed.append((drive_file.get("name"), str(exc)))
         except Exception as exc:
             log.error("Watcher poll error: %s", exc, exc_info=True)
+            failed.append(("(poll error)", str(exc)))
+
         if once:
-            log.info("One-shot run complete.")
-            break
+            total = succeeded + len(failed)
+            log.info("One-shot run complete. Processed: %d, Failed: %d", succeeded, len(failed))
+            _write_gha_summary(total, succeeded, failed)
+            return 1 if failed else 0
         time.sleep(POLL_INTERVAL_SECONDS)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -270,4 +312,5 @@ if __name__ == "__main__":
     drive_svc = _build_drive_service(cfg)
     gemini_client = genai.Client(api_key=cfg["GEMINI_API_KEY"])
 
-    run_watcher(drive_svc, gemini_client, schema, cfg, once=args.once)
+    exit_code = run_watcher(drive_svc, gemini_client, schema, cfg, once=args.once)
+    raise SystemExit(exit_code)
