@@ -1,3 +1,4 @@
+import argparse
 import io
 import json
 import logging
@@ -94,9 +95,13 @@ def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.
 # ---------------------------------------------------------------------------
 
 def _build_drive_service(config: dict):
-    creds = service_account.Credentials.from_service_account_file(
-        config["GOOGLE_SERVICE_ACCOUNT_JSON"], scopes=SCOPES
-    )
+    sa_value = config["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    # Support inline JSON string (used in GitHub Actions) or a file path
+    try:
+        sa_info = json.loads(sa_value)
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+    except (json.JSONDecodeError, ValueError):
+        creds = service_account.Credentials.from_service_account_file(sa_value, scopes=SCOPES)
     return build("drive", "v3", credentials=creds)
 
 
@@ -226,9 +231,12 @@ def process_file(
 # Watcher loop
 # ---------------------------------------------------------------------------
 
-def run_watcher(drive_service, gemini_client, schema: dict, config: dict) -> None:
+def run_watcher(drive_service, gemini_client, schema: dict, config: dict, once: bool = False) -> None:
     prompt = build_prompt(schema)
-    log.info("Watcher started. Polling every %ds.", POLL_INTERVAL_SECONDS)
+    if once:
+        log.info("Watcher running in one-shot mode.")
+    else:
+        log.info("Watcher started. Polling every %ds.", POLL_INTERVAL_SECONDS)
     while True:
         try:
             files = list_inbox_files(drive_service, config["INBOX_FOLDER_ID"])
@@ -240,6 +248,9 @@ def run_watcher(drive_service, gemini_client, schema: dict, config: dict) -> Non
                     log.error("Failed to process %s: %s", drive_file.get("name"), exc, exc_info=True)
         except Exception as exc:
             log.error("Watcher poll error: %s", exc, exc_info=True)
+        if once:
+            log.info("One-shot run complete.")
+            break
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -248,6 +259,10 @@ def run_watcher(drive_service, gemini_client, schema: dict, config: dict) -> Non
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="Process inbox once and exit (for cron/CI use)")
+    args = parser.parse_args()
+
     cfg = _load_env()
     schema = _load_schema()
     database.init_db()
@@ -255,4 +270,4 @@ if __name__ == "__main__":
     drive_svc = _build_drive_service(cfg)
     gemini_client = genai.Client(api_key=cfg["GEMINI_API_KEY"])
 
-    run_watcher(drive_svc, gemini_client, schema, cfg)
+    run_watcher(drive_svc, gemini_client, schema, cfg, once=args.once)
