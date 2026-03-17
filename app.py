@@ -352,12 +352,39 @@ def view_detail(interview_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+def _render_login() -> None:
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.title("PDUx Research Synthesizer")
+        st.subheader("Sign In")
+        with st.form("login_form"):
+            username = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In", use_container_width=True)
+        if submitted:
+            valid_user = st.secrets.get("auth", {}).get("username", "")
+            valid_pass = st.secrets.get("auth", {}).get("password", "")
+            if username == valid_user and password == valid_pass:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Invalid credentials.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     st.set_page_config(page_title="PDUx Research Synthesizer", layout="wide")
     database.init_db()
+
+    if not st.session_state.get("authenticated"):
+        _render_login()
+        st.stop()
 
     if "view" not in st.session_state:
         st.session_state["view"] = "Macro Dashboard"
