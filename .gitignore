@@ -1,4 +1,6 @@
 .env
+service-account-key.json
+*-service-account*.json
 *.db
 *.db-shm
 *.db-wal
@@ -6,3 +8,4 @@ tmp/
 __pycache__/
 *.pyc
 .pytest_cache/
+.streamlit/secrets.toml
