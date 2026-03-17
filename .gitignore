@@ -1,4 +1,6 @@
 .env
+service-account-key.json
+*-service-account*.json
 *.db
 *.db-shm
 *.db-wal
