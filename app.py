@@ -40,8 +40,7 @@ def clean_json(text: str) -> str:
 
 
 def load_all_interviews() -> pd.DataFrame:
-    with database.get_connection() as conn:
-        return pd.read_sql("SELECT * FROM interviews ORDER BY created_at DESC", conn)
+    return pd.read_sql("SELECT * FROM interviews ORDER BY created_at DESC", database.get_engine())
 
 
 def load_interview(interview_id: int) -> dict | None:

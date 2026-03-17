@@ -206,7 +206,7 @@ def process_file(
         data.get(f["key"]) for f in schema["fields"]
     ]
 
-    placeholders = ", ".join(["?"] * len(columns))
+    placeholders = ", ".join(["%s"] * len(columns))
     col_names = ", ".join(columns)
     with database.get_connection() as conn:
         conn.execute(
