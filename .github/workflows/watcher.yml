@@ -44,6 +44,7 @@ jobs:
           INBOX_FOLDER_ID: ${{ secrets.INBOX_FOLDER_ID }}
           ARCHIVE_FOLDER_ID: ${{ secrets.ARCHIVE_FOLDER_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python watcher.py --once
 

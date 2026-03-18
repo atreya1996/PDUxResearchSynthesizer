@@ -24,12 +24,19 @@ LIST_FIELDS = {f["key"] for f in FIELDS if f["type"] == "list"}
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+
 def get_gemini_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         st.error("GEMINI_API_KEY not set in environment.")
         st.stop()
     return genai.Client(api_key=api_key)
+
+
+def get_gemini_model() -> str:
+    return os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 
 
 def clean_json(text: str) -> str:
@@ -210,7 +217,7 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
         )
         with st.spinner("Generating personas and synthesis…"):
             try:
-                response = client.models.generate_content(model="gemini-1.5-pro", contents=prompt)
+                response = client.models.generate_content(model=get_gemini_model(), contents=prompt)
                 content = response.text
                 now = datetime.now(timezone.utc).isoformat()
                 with database.get_connection() as conn:
@@ -356,7 +363,7 @@ def view_detail(interview_id: int) -> None:
             with st.spinner("Re-extracting insights…"):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-1.5-pro", contents=prompt
+                        model=get_gemini_model(), contents=prompt
                     )
                     data = json.loads(clean_json(response.text))
 
