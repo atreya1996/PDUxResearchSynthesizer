@@ -261,11 +261,7 @@ def clean_json(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Gemini inline data limit: 20 MB raw (before base64 encoding).
-# Files larger than this must be split or compressed before processing.
-GEMINI_MAX_INLINE_BYTES = 20 * 1024 * 1024  # 20 MB
-
-# MIME types that Gemini can process inline.
+# MIME types that Gemini File API can process.
 # Anything not on this list will be rejected with an unhelpful error;
 # better to catch it here before consuming Drive quota on a download.
 _GEMINI_SUPPORTED_MIME_PREFIXES = ("video/", "audio/", "image/", "text/")
@@ -301,22 +297,30 @@ def detect_mime_type(file_path: Path) -> str:
     return mime
 
 
-def _check_inline_size(file_path: Path) -> None:
-    """Raise if the file exceeds the Gemini inline data limit (20 MB).
+def _upload_to_gemini(gemini_client, local_path: Path, mime_type: str, file_name: str):
+    """Upload a file to the Gemini File API and wait for it to become ACTIVE.
 
-    Inline requests encode the raw bytes as base64 inside the JSON payload,
-    so the actual HTTP request body is ~33 % larger than the file on disk.
-    The 20 MB cap is measured on the raw bytes, matching Gemini's documented
-    limit.  Catching this before calling generate_content avoids a confusing
-    API error and saves the download bandwidth already spent.
+    Using the File API instead of inline bytes avoids 500 errors that occur
+    when large video payloads are base64-encoded inside the request body.
+    Supports files up to 2 GB; Gemini processes the upload asynchronously
+    before the generate_content call is made.
     """
-    size = file_path.stat().st_size
-    if size > GEMINI_MAX_INLINE_BYTES:
-        raise ValueError(
-            f"'{file_path.name}' is {size / 1e6:.1f} MB, which exceeds the 20 MB "
-            "inline limit for Gemini requests.  Compress or trim the recording "
-            "before adding it to the inbox folder."
+    uploaded = retry_with_backoff(
+        lambda: gemini_client.files.upload(
+            path=local_path,
+            config={"mime_type": mime_type, "display_name": file_name},
         )
+    )
+    # Poll until ACTIVE — video processing typically takes a few seconds.
+    for _ in range(30):
+        file_info = gemini_client.files.get(name=uploaded.name)
+        state = file_info.state.name if hasattr(file_info.state, "name") else str(file_info.state)
+        if state == "ACTIVE":
+            return uploaded
+        if state == "FAILED":
+            raise RuntimeError(f"Gemini File API processing failed for '{file_name}'")
+        time.sleep(2)
+    raise TimeoutError(f"Gemini file '{file_name}' did not become ACTIVE within 60 seconds")
 
 
 def process_file(
@@ -335,32 +339,27 @@ def process_file(
     local_path = download_file(drive_service, file_id, file_name)
     size_mb = local_path.stat().st_size / (1024 * 1024)
 
-    # Validate MIME type and size before reading bytes — fail fast before
-    # spending memory or API quota on an unprocessable file.
+    # Validate MIME type before upload — fail fast before spending API quota
+    # on an unprocessable file.
     mime_type = detect_mime_type(local_path)
-    _check_inline_size(local_path)
     log.info("[DOWNLOADED] %s (%.1f MB, %s)", file_name, size_mb, mime_type)
 
-    # Read file bytes once.  The Part object is reused across retry attempts,
-    # so we don't re-read the file on each retry.
-    file_bytes = local_path.read_bytes()
-    media_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
-
     data = None
+    uploaded_file = None
     try:
-        # Send the file inline — no upload step, no polling, no async state
-        # machine.  Transcription and extraction happen in a single API call.
-        # Timeout of 600 s covers the longest realistic interview clip at this
-        # file size; increase if processing stalls on unusually dense audio.
-        log.info(
-            "[GEMINI] Sending %s inline (%.1f MB) for transcription + extraction…",
-            file_name,
-            size_mb,
-        )
+        # Upload via the Gemini File API — avoids 500 errors caused by
+        # base64-encoding large video payloads inline in the request body.
+        # The File API supports up to 2 GB and processes the file async
+        # before generate_content is called.
+        log.info("[GEMINI] Uploading %s (%.1f MB) via File API…", file_name, size_mb)
+        uploaded_file = _upload_to_gemini(gemini_client, local_path, mime_type, file_name)
+        log.info("[GEMINI] File ACTIVE — running transcription + extraction…")
+
+        file_part = types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=mime_type)
         response = retry_with_backoff(
             lambda: gemini_client.models.generate_content(
                 model=gemini_model,
-                contents=[media_part, prompt],
+                contents=[file_part, prompt],
                 config={"http_options": {"timeout": _GEMINI_TIMEOUT_MS}},
             )
         )
@@ -368,9 +367,16 @@ def process_file(
         data = json.loads(clean_json(raw))
         log.info("[TRANSCRIBED] %s (%d chars)", file_name, len(raw))
     finally:
-        # Always clean up the local tmp file, whether or not Gemini succeeded.
+        # Always clean up both the local tmp file and the Gemini-hosted file
+        # (data privacy — per architectural constraint #3 in CLAUDE.md).
         local_path.unlink(missing_ok=True)
         log.info("[TMP CLEANUP] Removed local file %s", file_name)
+        if uploaded_file is not None:
+            try:
+                gemini_client.files.delete(name=uploaded_file.name)
+                log.info("[GEMINI CLEANUP] Deleted uploaded file for %s", file_name)
+            except Exception as del_exc:
+                log.warning("[GEMINI CLEANUP] Failed to delete uploaded file for %s: %s", file_name, del_exc)
 
     # Reached only when transcription succeeded (data is not None).
     # Serialize list fields
