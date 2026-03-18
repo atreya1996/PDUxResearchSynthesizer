@@ -19,8 +19,8 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
 
-  validate-sdk:
-    name: Validate SDK API contract
+  smoke-test:
+    name: Smoke-test imports
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,28 +29,21 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install --force-reinstall google-genai==1.67.0
-      - name: Assert files.upload uses file= not path=
+        run: pip install -r requirements.txt
+      - name: Assert inline API is available
         run: |
           python - <<'EOF'
-          from google import genai
+          from google.genai import types
+
+          # Verify types.Part.from_bytes exists and accepts the expected args.
           import inspect
-
-          sig = inspect.signature(genai.client.Files.upload)
+          sig = inspect.signature(types.Part.from_bytes)
           params = list(sig.parameters.keys())
-          print("google-genai files.upload params:", params)
-
-          assert "file" in params, (
-              f"BREAKING: files.upload no longer accepts file= (got {params}). "
+          assert "data" in params and "mime_type" in params, (
+              f"BREAKING: types.Part.from_bytes signature changed (got {params}). "
               "Update watcher.py and pin the new version in requirements.txt."
           )
-          assert "path" not in params, (
-              f"WARNING: files.upload has reverted to path= (got {params}). "
-              "Update watcher.py accordingly."
-          )
-          print("API contract OK")
+          print("types.Part.from_bytes signature OK:", params)
           EOF
       - name: Smoke-test imports
         run: |

@@ -1,6 +1,4 @@
 import argparse
-import importlib.metadata
-import inspect
 import json
 import logging
 import mimetypes
@@ -12,6 +10,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -19,9 +18,6 @@ from googleapiclient.http import MediaIoBaseDownload
 import database
 
 load_dotenv()
-
-# Log SDK version immediately so every run's artifact is self-contained.
-_GENAI_VERSION = importlib.metadata.version("google-genai")
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 POLL_INTERVAL_SECONDS = 60
@@ -97,6 +93,7 @@ def build_prompt(schema: dict) -> str:
 def _parse_retry_delay(exc: Exception) -> float | None:
     """Extract the suggested retry delay (seconds) from a 429 error message, if present."""
     import re
+
     msg = str(exc)
     m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", msg, re.IGNORECASE)
     if m:
@@ -112,7 +109,11 @@ def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.
         except Exception as exc:
             last_exc = exc
             suggested = _parse_retry_delay(exc)
-            delay = max(base_delay * (2**attempt), suggested) if suggested else base_delay * (2**attempt)
+            delay = (
+                max(base_delay * (2**attempt), suggested)
+                if suggested
+                else base_delay * (2**attempt)
+            )
             log.warning(
                 "Attempt %d/%d failed (%s). Retrying in %.1fs…",
                 attempt + 1,
@@ -189,58 +190,17 @@ def clean_json(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gemini helpers
-# ---------------------------------------------------------------------------
-
-
-def _validate_gemini_client(client) -> None:
-    """Log SDK version and assert the files.upload API is what we expect.
-
-    This runs once at startup and surfaces version mismatches immediately,
-    before any file is downloaded from Drive.
-    """
-    log.info("google-genai SDK version: %s", _GENAI_VERSION)
-    sig = inspect.signature(client.files.upload)
-    params = list(sig.parameters.keys())
-    log.info("files.upload() parameters: %s", params)
-    if "file" not in params and "path" not in params:
-        raise RuntimeError(
-            f"Unrecognised files.upload() signature {sig}. "
-            "Pin google-genai to a known version in requirements.txt."
-        )
-
-
-def _gemini_upload(client, local_path: Path, mime_type: str):
-    """Upload a local file to Gemini Files API.
-
-    Detects the parameter name at runtime so the code works regardless of
-    which google-genai version is installed:
-      - >= 1.0:  files.upload(file=..., config={"mime_type": ...})
-      - == 0.5:  files.upload(path=..., config={"mime_type": ...})
-    """
-    sig = inspect.signature(client.files.upload)
-    if "file" in sig.parameters:
-        return client.files.upload(file=str(local_path), config={"mime_type": mime_type})
-    # Fallback: old SDK (google-genai 0.x) used path= instead of file=
-    log.warning(
-        "Falling back to legacy files.upload(path=) API "
-        "(google-genai %s). Upgrade to >=1.0 or pin to ==1.67.0.",
-        _GENAI_VERSION,
-    )
-    return client.files.upload(path=str(local_path), config={"mime_type": mime_type})
-
-
-# ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
 
 
-# Gemini Files API hard limits.
-GEMINI_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024   # 2 GB
-GEMINI_WARN_UPLOAD_BYTES = 500 * 1024 * 1024         # 500 MB — log a warning
+# Gemini inline data limit: 20 MB raw (before base64 encoding).
+# Files larger than this must be split or compressed before processing.
+GEMINI_MAX_INLINE_BYTES = 20 * 1024 * 1024  # 20 MB
 
-# MIME types that Gemini's Files API can process.  Anything not on this list
-# will be rejected by the API with an unhelpful error; better to catch it here.
+# MIME types that Gemini can process inline.
+# Anything not on this list will be rejected with an unhelpful error;
+# better to catch it here before consuming Drive quota on a download.
 _GEMINI_SUPPORTED_MIME_PREFIXES = ("video/", "audio/", "image/", "text/")
 
 
@@ -269,94 +229,27 @@ def detect_mime_type(file_path: Path) -> str:
     if not any(mime.startswith(p) for p in _GEMINI_SUPPORTED_MIME_PREFIXES):
         raise ValueError(
             f"Unsupported MIME type '{mime}' for '{file_path.name}'. "
-            f"Gemini Files API only accepts: {_GEMINI_SUPPORTED_MIME_PREFIXES}"
+            f"Gemini only accepts: {_GEMINI_SUPPORTED_MIME_PREFIXES}"
         )
     return mime
 
 
-def _check_file_size(file_path: Path) -> None:
-    size = file_path.stat().st_size
-    if size > GEMINI_MAX_UPLOAD_BYTES:
-        raise ValueError(
-            f"'{file_path.name}' is {size / 1e9:.2f} GB, exceeding Gemini's "
-            "2 GB per-file limit. Split or compress the file before processing."
-        )
-    if size > GEMINI_WARN_UPLOAD_BYTES:
-        log.warning(
-            "[SIZE WARNING] %s is %.0f MB. Upload and ACTIVE polling may take "
-            "several minutes. Ensure the GHA job timeout is set high enough.",
-            file_path.name,
-            size / 1e6,
-        )
+def _check_inline_size(file_path: Path) -> None:
+    """Raise if the file exceeds the Gemini inline data limit (20 MB).
 
-
-def _wait_for_file_active(
-    client,
-    uploaded_file,
-    poll_interval: float = 5.0,
-    timeout: float = 300.0,
-    max_transient_errors: int = 6,
-) -> None:
-    """Poll until the Gemini file reaches ACTIVE state (or raise on failure/timeout).
-
-    Design decisions:
-    - Initial 5 s sleep: Gemini's backend may not have committed the file record
-      immediately after upload, causing spurious 500s on the very first poll.
-    - Transient-error tolerance: 5xx errors during polling are counted separately
-      from the ACTIVE-wait loop.  Up to ``max_transient_errors`` consecutive
-      transient errors are retried before giving up.  The counter resets on any
-      successful response.
-    - timeout=300 s: large video files (>100 MB) can take several minutes to
-      process on Gemini's side; 120 s was too tight.
+    Inline requests encode the raw bytes as base64 inside the JSON payload,
+    so the actual HTTP request body is ~33 % larger than the file on disk.
+    The 20 MB cap is measured on the raw bytes, matching Gemini's documented
+    limit.  Catching this before calling generate_content avoids a confusing
+    API error and saves the download bandwidth already spent.
     """
-    # Give Gemini's backend a moment to commit the file record before first poll.
-    log.info("[GEMINI] Waiting 5 s for file record to propagate before polling…")
-    time.sleep(5.0)
-
-    deadline = time.time() + timeout
-    consecutive_transient = 0
-
-    while True:
-        try:
-            info = client.files.get(name=uploaded_file.name)
-            consecutive_transient = 0  # reset on success
-        except Exception as exc:
-            consecutive_transient += 1
-            log.warning(
-                "[GEMINI] Transient error polling %s (%d/%d): %s",
-                uploaded_file.name,
-                consecutive_transient,
-                max_transient_errors,
-                exc,
-            )
-            if consecutive_transient >= max_transient_errors:
-                raise RuntimeError(
-                    f"Too many consecutive transient errors polling {uploaded_file.name} "
-                    f"(last: {exc})"
-                ) from exc
-            if time.time() >= deadline:
-                raise TimeoutError(
-                    f"Gemini file {uploaded_file.name} timed out while polling "
-                    f"(last error: {exc})"
-                ) from exc
-            time.sleep(poll_interval)
-            continue
-
-        state = getattr(info, "state", None)
-        # google-genai represents state as an enum; compare by name or value
-        state_name = state.name if hasattr(state, "name") else str(state)
-        if state_name == "ACTIVE":
-            log.info("[GEMINI] File %s is ACTIVE.", uploaded_file.name)
-            return
-        if state_name == "FAILED":
-            raise RuntimeError(f"Gemini file {uploaded_file.name} entered FAILED state")
-        if time.time() >= deadline:
-            raise TimeoutError(
-                f"Gemini file {uploaded_file.name} not ACTIVE after {timeout}s "
-                f"(state={state_name})"
-            )
-        log.info("[GEMINI] Waiting for %s to become ACTIVE (state=%s)…", uploaded_file.name, state_name)
-        time.sleep(poll_interval)
+    size = file_path.stat().st_size
+    if size > GEMINI_MAX_INLINE_BYTES:
+        raise ValueError(
+            f"'{file_path.name}' is {size / 1e6:.1f} MB, which exceeds the 20 MB "
+            "inline limit for Gemini requests.  Compress or trim the recording "
+            "before adding it to the inbox folder."
+        )
 
 
 def process_file(
@@ -375,41 +268,40 @@ def process_file(
     local_path = download_file(drive_service, file_id, file_name)
     size_mb = local_path.stat().st_size / (1024 * 1024)
 
-    # Validate before uploading — catch bad MIME types and oversized files
-    # immediately rather than burning Gemini quota on an unprocessable upload.
-    _check_file_size(local_path)
+    # Validate MIME type and size before reading bytes — fail fast before
+    # spending memory or API quota on an unprocessable file.
     mime_type = detect_mime_type(local_path)
+    _check_inline_size(local_path)
     log.info("[DOWNLOADED] %s (%.1f MB, %s)", file_name, size_mb, mime_type)
 
-    uploaded = retry_with_backoff(lambda: _gemini_upload(gemini_client, local_path, mime_type))
-    log.info("[UPLOADED TO GEMINI] %s -> %s", file_name, uploaded.name)
+    # Read file bytes once.  The Part object is reused across retry attempts,
+    # so we don't re-read the file on each retry.
+    file_bytes = local_path.read_bytes()
+    media_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
 
-    # --- Everything after upload is wrapped so cleanup is ALWAYS guaranteed ---
-    # This covers _wait_for_file_active, generate_content, and JSON parsing.
-    # If any of those raise, the Gemini file and the local tmp file are still
-    # deleted before the exception propagates.
     data = None
     try:
-        _wait_for_file_active(gemini_client, uploaded)
-        # Explicit 20-minute HTTP timeout: long video transcription can take
-        # 10-15 minutes.  Without this the SDK uses its own default (which may
-        # be much shorter), causing a misleading timeout error mid-transcription.
+        # Send the file inline — no upload step, no polling, no async state
+        # machine.  Transcription and extraction happen in a single API call.
+        # Timeout of 600 s covers the longest realistic interview clip at this
+        # file size; increase if processing stalls on unusually dense audio.
+        log.info(
+            "[GEMINI] Sending %s inline (%.1f MB) for transcription + extraction…",
+            file_name,
+            size_mb,
+        )
         response = retry_with_backoff(
             lambda: gemini_client.models.generate_content(
                 model=gemini_model,
-                contents=[uploaded, prompt],
-                config={"http_options": {"timeout": 1200}},
+                contents=[media_part, prompt],
+                config={"http_options": {"timeout": 600}},
             )
         )
         raw = response.text
         data = json.loads(clean_json(raw))
         log.info("[TRANSCRIBED] %s (%d chars)", file_name, len(raw))
     finally:
-        try:
-            gemini_client.files.delete(name=uploaded.name)
-            log.info("[GEMINI CLEANUP] Deleted %s", uploaded.name)
-        except Exception as exc:
-            log.warning("[GEMINI CLEANUP] Could not delete %s: %s", uploaded.name, exc)
+        # Always clean up the local tmp file, whether or not Gemini succeeded.
         local_path.unlink(missing_ok=True)
         log.info("[TMP CLEANUP] Removed local file %s", file_name)
 
@@ -540,9 +432,6 @@ if __name__ == "__main__":
 
     drive_svc = _build_drive_service(cfg)
     gemini_client = genai.Client(api_key=cfg["GEMINI_API_KEY"])
-
-    # Validate SDK contract before touching any files — surfaces mismatches immediately.
-    _validate_gemini_client(gemini_client)
 
     exit_code = run_watcher(drive_svc, gemini_client, schema, cfg, once=args.once)
     raise SystemExit(exit_code)
