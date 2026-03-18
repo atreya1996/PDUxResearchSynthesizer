@@ -10,3 +10,4 @@ __pycache__/
 .pytest_cache/
 .streamlit/secrets.toml
 logs/
+.claude/settings.local.json
