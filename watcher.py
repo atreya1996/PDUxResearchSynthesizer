@@ -45,6 +45,10 @@ log = logging.getLogger(__name__)
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
+# HttpOptions.timeout is in milliseconds (confirmed: google-genai SDK divides by 1000 internally).
+# 600 s = 600 000 ms covers the longest realistic interview clip sent inline.
+_GEMINI_TIMEOUT_MS = 600_000
+
 
 def _load_env() -> dict:
     required = [
@@ -101,6 +105,24 @@ def _parse_retry_delay(exc: Exception) -> float | None:
     return None
 
 
+def _is_retryable(exc: Exception) -> bool:
+    """Return False for permanent 4xx client errors that retrying can never fix.
+
+    Only 429 (rate-limit) among 4xx errors is transient.  Everything else
+    (400 INVALID_ARGUMENT, 401 Unauthorized, 403 Forbidden, 404 Not Found…)
+    is a hard configuration or input error — retrying just wastes time and
+    produces misleading log noise.
+    """
+    try:
+        from google.genai import errors as _genai_errors
+
+        if isinstance(exc, _genai_errors.ClientError):
+            return getattr(exc, "status_code", 0) == 429
+    except ImportError:
+        pass
+    return True
+
+
 def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.0, **kwargs):
     last_exc = None
     for attempt in range(max_retries):
@@ -108,6 +130,9 @@ def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.
             return func(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
+            if not _is_retryable(exc):
+                log.error("Non-retryable error — will not retry: %s", exc)
+                raise
             suggested = _parse_retry_delay(exc)
             delay = (
                 max(base_delay * (2**attempt), suggested)
@@ -294,7 +319,7 @@ def process_file(
             lambda: gemini_client.models.generate_content(
                 model=gemini_model,
                 contents=[media_part, prompt],
-                config={"http_options": {"timeout": 600}},
+                config={"http_options": {"timeout": _GEMINI_TIMEOUT_MS}},
             )
         )
         raw = response.text

@@ -253,7 +253,11 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
         with st.spinner("Generating personas and synthesis…"):
             try:
                 response = retry_with_backoff(
-                    lambda: client.models.generate_content(model=get_gemini_model(), contents=prompt)
+                    lambda: client.models.generate_content(
+                        model=get_gemini_model(),
+                        contents=prompt,
+                        config={"http_options": {"timeout": 120_000}},  # 120 s in ms
+                    )
                 )
                 content = response.text
                 now = datetime.now(timezone.utc).isoformat()
@@ -400,7 +404,11 @@ def view_detail(interview_id: int) -> None:
             with st.spinner("Re-extracting insights…"):
                 try:
                     response = retry_with_backoff(
-                        lambda: client.models.generate_content(model=get_gemini_model(), contents=prompt)
+                        lambda: client.models.generate_content(
+                            model=get_gemini_model(),
+                            contents=prompt,
+                            config={"http_options": {"timeout": 120_000}},  # 120 s in ms
+                        )
                     )
                     data = json.loads(clean_json(response.text))
 
