@@ -94,6 +94,16 @@ def build_prompt(schema: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _parse_retry_delay(exc: Exception) -> float | None:
+    """Extract the suggested retry delay (seconds) from a 429 error message, if present."""
+    import re
+    msg = str(exc)
+    m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", msg, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    return None
+
+
 def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.0, **kwargs):
     last_exc = None
     for attempt in range(max_retries):
@@ -101,7 +111,8 @@ def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.
             return func(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            delay = base_delay * (2**attempt)
+            suggested = _parse_retry_delay(exc)
+            delay = max(base_delay * (2**attempt), suggested) if suggested else base_delay * (2**attempt)
             log.warning(
                 "Attempt %d/%d failed (%s). Retrying in %.1fs…",
                 attempt + 1,
