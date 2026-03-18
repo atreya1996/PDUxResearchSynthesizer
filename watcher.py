@@ -56,6 +56,7 @@ def _load_env() -> dict:
         "INBOX_FOLDER_ID",
         "ARCHIVE_FOLDER_ID",
         "GEMINI_API_KEY",
+        "DATABASE_URL",
     ]
     config = {k: os.environ.get(k) for k in required}
     missing = [k for k, v in config.items() if not v]
@@ -312,8 +313,10 @@ def _upload_to_gemini(gemini_client, local_path: Path, mime_type: str, file_name
         )
     )
     # Poll until ACTIVE — video processing typically takes a few seconds.
+    # files.get() is wrapped in retry_with_backoff so transient 500s during
+    # async processing don't abort the whole file.
     for _ in range(30):
-        file_info = gemini_client.files.get(name=uploaded.name)
+        file_info = retry_with_backoff(lambda: gemini_client.files.get(name=uploaded.name))
         state = file_info.state.name if hasattr(file_info.state, "name") else str(file_info.state)
         if state == "ACTIVE":
             return uploaded
@@ -363,7 +366,16 @@ def process_file(
                 config={"http_options": {"timeout": _GEMINI_TIMEOUT_MS}},
             )
         )
-        raw = response.text
+        raw = response.text if response.text else None
+        if not raw:
+            # Gemini returned no text — most likely a safety filter block.
+            # Raise so the file stays unarchived and the run reports a failure
+            # rather than silently writing null data to the DB.
+            finish = getattr(response.candidates[0], "finish_reason", "unknown") if response.candidates else "no_candidates"
+            raise RuntimeError(
+                f"Gemini returned no text for '{file_name}' (finish_reason={finish}). "
+                "Check safety filter settings or file content."
+            )
         data = json.loads(clean_json(raw))
         log.info("[TRANSCRIBED] %s (%d chars)", file_name, len(raw))
     finally:

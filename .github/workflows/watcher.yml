@@ -15,10 +15,10 @@ concurrency:
 jobs:
   run-watcher:
     runs-on: ubuntu-latest
-    # Budget: up to 10 files × ~5 min per inline generate_content call
-    # = 50 min.  45 min covers the realistic batch with headroom for retries
+    # Budget: up to 10 files × 10 min Gemini timeout (_GEMINI_TIMEOUT_MS=600s)
+    # = 100 min worst case.  120 min covers a full batch with retry headroom
     # and is well within GitHub Actions' 6-hour hard limit.
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
