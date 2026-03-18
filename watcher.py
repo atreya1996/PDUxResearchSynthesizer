@@ -307,7 +307,7 @@ def _upload_to_gemini(gemini_client, local_path: Path, mime_type: str, file_name
     """
     uploaded = retry_with_backoff(
         lambda: gemini_client.files.upload(
-            path=local_path,
+            file=local_path,
             config={"mime_type": mime_type, "display_name": file_name},
         )
     )
