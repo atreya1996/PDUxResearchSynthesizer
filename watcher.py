@@ -229,6 +229,24 @@ def detect_mime_type(file_path: Path) -> str:
     return mime or "application/octet-stream"
 
 
+def _wait_for_file_active(client, uploaded_file, poll_interval: float = 2.0, timeout: float = 120.0) -> None:
+    """Poll until the Gemini file reaches ACTIVE state (or raise on failure/timeout)."""
+    deadline = time.time() + timeout
+    while True:
+        info = client.files.get(name=uploaded_file.name)
+        state = getattr(info, "state", None)
+        # google-genai represents state as an enum; compare by name or value
+        state_name = state.name if hasattr(state, "name") else str(state)
+        if state_name == "ACTIVE":
+            return
+        if state_name == "FAILED":
+            raise RuntimeError(f"Gemini file {uploaded_file.name} entered FAILED state")
+        if time.time() >= deadline:
+            raise TimeoutError(f"Gemini file {uploaded_file.name} not ACTIVE after {timeout}s (state={state_name})")
+        log.info("[GEMINI] Waiting for %s to become ACTIVE (state=%s)…", uploaded_file.name, state_name)
+        time.sleep(poll_interval)
+
+
 def process_file(
     drive_service,
     drive_file: dict,
@@ -249,6 +267,9 @@ def process_file(
 
     uploaded = retry_with_backoff(lambda: _gemini_upload(gemini_client, local_path, mime_type))
     log.info("[UPLOADED TO GEMINI] %s -> %s", file_name, uploaded.name)
+
+    # Wait for Gemini file to reach ACTIVE state before use
+    _wait_for_file_active(gemini_client, uploaded)
 
     try:
         response = retry_with_backoff(
