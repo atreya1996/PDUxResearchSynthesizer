@@ -312,11 +312,19 @@ def _upload_to_gemini(gemini_client, local_path: Path, mime_type: str, file_name
             config={"mime_type": mime_type, "display_name": file_name},
         )
     )
-    # Poll until ACTIVE — video processing typically takes a few seconds.
-    # files.get() is wrapped in retry_with_backoff so transient 500s during
-    # async processing don't abort the whole file.
+    # Poll until ACTIVE — video processing is async and typically takes a few
+    # seconds, but the backend can return 500 while it is still converting.
+    # The loop itself is the retry mechanism; wrapping files.get() in
+    # retry_with_backoff as well caused double-retry (SDK tenacity + ours)
+    # and burned all attempts on the very first 500 rather than waiting for
+    # the file to become ready.  We just catch, log, and continue instead.
     for _ in range(30):
-        file_info = retry_with_backoff(lambda: gemini_client.files.get(name=uploaded.name))
+        try:
+            file_info = gemini_client.files.get(name=uploaded.name)
+        except Exception as poll_exc:  # noqa: BLE001
+            log.debug("Transient error polling '%s' state (will retry): %s", file_name, poll_exc)
+            time.sleep(2)
+            continue
         state = file_info.state.name if hasattr(file_info.state, "name") else str(file_info.state)
         if state == "ACTIVE":
             return uploaded
