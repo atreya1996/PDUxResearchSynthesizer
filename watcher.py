@@ -318,12 +318,15 @@ def _upload_to_gemini(gemini_client, local_path: Path, mime_type: str, file_name
     # and continue rather than using retry_with_backoff (which caused cascading
     # double-retries alongside the SDK's own tenacity layer).
     #
-    # If files.get() returns 500 persistently (observed in production: Gemini
-    # status endpoint degrades while processing is actually completing), we
-    # skip the ACTIVE wait after _STUCK_500_THRESHOLD consecutive errors and
-    # return the upload handle directly.  generate_content will then either
-    # succeed (file was ready) or fail descriptively (file truly not ready).
-    _STUCK_500_THRESHOLD = 10  # ~20 s of consecutive 500s → assume possibly ready
+    # Observed failure mode: files.get() returns HTTP 500 for the entire
+    # polling window.  This means the Gemini processing pipeline crashed
+    # internally (e.g. unsupported codec, corrupt container) and cannot
+    # serialize the FAILED state cleanly.  Attempting generate_content
+    # in this state yields 400 FAILED_PRECONDITION ("not in ACTIVE state").
+    # After _STUCK_500_THRESHOLD consecutive errors we therefore raise
+    # RuntimeError (not TimeoutError) so the file stays in the inbox and
+    # will be retried on the next watcher run without being archived.
+    _STUCK_500_THRESHOLD = 10  # ~20 s of consecutive 500s → treat as backend failure
     consecutive_errors = 0
     for _ in range(30):
         try:
@@ -336,13 +339,12 @@ def _upload_to_gemini(gemini_client, local_path: Path, mime_type: str, file_name
                 file_name, consecutive_errors, poll_exc,
             )
             if consecutive_errors >= _STUCK_500_THRESHOLD:
-                log.warning(
-                    "[GEMINI] '%s': files.get() has returned errors for ~%ds straight. "
-                    "Status endpoint may be degraded — skipping ACTIVE wait and "
-                    "attempting generate_content directly.",
-                    file_name, consecutive_errors * 2,
-                )
-                return uploaded
+                raise RuntimeError(
+                    f"Gemini File API processing appears to have crashed for "
+                    f"'{file_name}' (files.get() returned errors for "
+                    f"~{consecutive_errors * 2}s straight). "
+                    f"File left in inbox for retry."
+                ) from poll_exc
             time.sleep(2)
             continue
         state = file_info.state.name if hasattr(file_info.state, "name") else str(file_info.state)
