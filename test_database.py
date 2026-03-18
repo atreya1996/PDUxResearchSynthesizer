@@ -1,7 +1,5 @@
 import json
 import sqlite3
-import tempfile
-from pathlib import Path
 from unittest.mock import patch
 
 import database
@@ -14,9 +12,7 @@ def test_init_db_creates_tables(tmp_path):
         conn = sqlite3.connect(db_file)
         tables = {
             row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
         conn.close()
     assert "interviews" in tables

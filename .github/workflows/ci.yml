@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install ruff
+      - run: ruff check .
+      - run: ruff format --check .
+
+  validate-sdk:
+    name: Validate SDK API contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install --force-reinstall google-genai==1.67.0
+      - name: Assert files.upload uses file= not path=
+        run: |
+          python - <<'EOF'
+          from google import genai
+          import inspect
+
+          sig = inspect.signature(genai.client.Files.upload)
+          params = list(sig.parameters.keys())
+          print("google-genai files.upload params:", params)
+
+          assert "file" in params, (
+              f"BREAKING: files.upload no longer accepts file= (got {params}). "
+              "Update watcher.py and pin the new version in requirements.txt."
+          )
+          assert "path" not in params, (
+              f"WARNING: files.upload has reverted to path= (got {params}). "
+              "Update watcher.py accordingly."
+          )
+          print("API contract OK")
+          EOF
+      - name: Smoke-test imports
+        run: |
+          python -c "import watcher; print('watcher imports OK')"
+          python -c "import database; print('database imports OK')"
