@@ -314,15 +314,35 @@ def _upload_to_gemini(gemini_client, local_path: Path, mime_type: str, file_name
     )
     # Poll until ACTIVE — video processing is async and typically takes a few
     # seconds, but the backend can return 500 while it is still converting.
-    # The loop itself is the retry mechanism; wrapping files.get() in
-    # retry_with_backoff as well caused double-retry (SDK tenacity + ours)
-    # and burned all attempts on the very first 500 rather than waiting for
-    # the file to become ready.  We just catch, log, and continue instead.
+    # The loop itself is the retry mechanism; we just catch exceptions inline
+    # and continue rather than using retry_with_backoff (which caused cascading
+    # double-retries alongside the SDK's own tenacity layer).
+    #
+    # If files.get() returns 500 persistently (observed in production: Gemini
+    # status endpoint degrades while processing is actually completing), we
+    # skip the ACTIVE wait after _STUCK_500_THRESHOLD consecutive errors and
+    # return the upload handle directly.  generate_content will then either
+    # succeed (file was ready) or fail descriptively (file truly not ready).
+    _STUCK_500_THRESHOLD = 10  # ~20 s of consecutive 500s → assume possibly ready
+    consecutive_errors = 0
     for _ in range(30):
         try:
             file_info = gemini_client.files.get(name=uploaded.name)
+            consecutive_errors = 0  # reset on any successful response
         except Exception as poll_exc:  # noqa: BLE001
-            log.debug("Transient error polling '%s' state (will retry): %s", file_name, poll_exc)
+            consecutive_errors += 1
+            log.debug(
+                "Transient error polling '%s' state (%d consecutive, will retry): %s",
+                file_name, consecutive_errors, poll_exc,
+            )
+            if consecutive_errors >= _STUCK_500_THRESHOLD:
+                log.warning(
+                    "[GEMINI] '%s': files.get() has returned errors for ~%ds straight. "
+                    "Status endpoint may be degraded — skipping ACTIVE wait and "
+                    "attempting generate_content directly.",
+                    file_name, consecutive_errors * 2,
+                )
+                return uploaded
             time.sleep(2)
             continue
         state = file_info.state.name if hasattr(file_info.state, "name") else str(file_info.state)
