@@ -240,20 +240,71 @@ def detect_mime_type(file_path: Path) -> str:
     return mime or "application/octet-stream"
 
 
-def _wait_for_file_active(client, uploaded_file, poll_interval: float = 2.0, timeout: float = 120.0) -> None:
-    """Poll until the Gemini file reaches ACTIVE state (or raise on failure/timeout)."""
+def _wait_for_file_active(
+    client,
+    uploaded_file,
+    poll_interval: float = 5.0,
+    timeout: float = 300.0,
+    max_transient_errors: int = 6,
+) -> None:
+    """Poll until the Gemini file reaches ACTIVE state (or raise on failure/timeout).
+
+    Design decisions:
+    - Initial 5 s sleep: Gemini's backend may not have committed the file record
+      immediately after upload, causing spurious 500s on the very first poll.
+    - Transient-error tolerance: 5xx errors during polling are counted separately
+      from the ACTIVE-wait loop.  Up to ``max_transient_errors`` consecutive
+      transient errors are retried before giving up.  The counter resets on any
+      successful response.
+    - timeout=300 s: large video files (>100 MB) can take several minutes to
+      process on Gemini's side; 120 s was too tight.
+    """
+    # Give Gemini's backend a moment to commit the file record before first poll.
+    log.info("[GEMINI] Waiting 5 s for file record to propagate before polling…")
+    time.sleep(5.0)
+
     deadline = time.time() + timeout
+    consecutive_transient = 0
+
     while True:
-        info = client.files.get(name=uploaded_file.name)
+        try:
+            info = client.files.get(name=uploaded_file.name)
+            consecutive_transient = 0  # reset on success
+        except Exception as exc:
+            consecutive_transient += 1
+            log.warning(
+                "[GEMINI] Transient error polling %s (%d/%d): %s",
+                uploaded_file.name,
+                consecutive_transient,
+                max_transient_errors,
+                exc,
+            )
+            if consecutive_transient >= max_transient_errors:
+                raise RuntimeError(
+                    f"Too many consecutive transient errors polling {uploaded_file.name} "
+                    f"(last: {exc})"
+                ) from exc
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"Gemini file {uploaded_file.name} timed out while polling "
+                    f"(last error: {exc})"
+                ) from exc
+            time.sleep(poll_interval)
+            continue
+
         state = getattr(info, "state", None)
         # google-genai represents state as an enum; compare by name or value
         state_name = state.name if hasattr(state, "name") else str(state)
         if state_name == "ACTIVE":
+            log.info("[GEMINI] File %s is ACTIVE.", uploaded_file.name)
             return
         if state_name == "FAILED":
             raise RuntimeError(f"Gemini file {uploaded_file.name} entered FAILED state")
         if time.time() >= deadline:
-            raise TimeoutError(f"Gemini file {uploaded_file.name} not ACTIVE after {timeout}s (state={state_name})")
+            raise TimeoutError(
+                f"Gemini file {uploaded_file.name} not ACTIVE after {timeout}s "
+                f"(state={state_name})"
+            )
         log.info("[GEMINI] Waiting for %s to become ACTIVE (state=%s)…", uploaded_file.name, state_name)
         time.sleep(poll_interval)
 
@@ -279,10 +330,13 @@ def process_file(
     uploaded = retry_with_backoff(lambda: _gemini_upload(gemini_client, local_path, mime_type))
     log.info("[UPLOADED TO GEMINI] %s -> %s", file_name, uploaded.name)
 
-    # Wait for Gemini file to reach ACTIVE state before use
-    _wait_for_file_active(gemini_client, uploaded)
-
+    # --- Everything after upload is wrapped so cleanup is ALWAYS guaranteed ---
+    # This covers _wait_for_file_active, generate_content, and JSON parsing.
+    # If any of those raise, the Gemini file and the local tmp file are still
+    # deleted before the exception propagates.
+    data = None
     try:
+        _wait_for_file_active(gemini_client, uploaded)
         response = retry_with_backoff(
             lambda: gemini_client.models.generate_content(
                 model=gemini_model,
@@ -298,7 +352,10 @@ def process_file(
             log.info("[GEMINI CLEANUP] Deleted %s", uploaded.name)
         except Exception as exc:
             log.warning("[GEMINI CLEANUP] Could not delete %s: %s", uploaded.name, exc)
+        local_path.unlink(missing_ok=True)
+        log.info("[TMP CLEANUP] Removed local file %s", file_name)
 
+    # Reached only when transcription succeeded (data is not None).
     # Serialize list fields
     for field in schema["fields"]:
         key = field["key"]
@@ -324,9 +381,7 @@ def process_file(
     log.info("[SAVED TO DB] %s", file_name)
 
     move_to_archive(drive_service, file_id, config["INBOX_FOLDER_ID"], config["ARCHIVE_FOLDER_ID"])
-    log.info("[ARCHIVED] %s", file_name)
-
-    local_path.unlink(missing_ok=True)
+    log.info("[ARCHIVED] %s → archive", file_name)
     log.info("[DONE] %s", file_name)
 
 
