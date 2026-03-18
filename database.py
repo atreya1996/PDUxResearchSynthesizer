@@ -8,6 +8,14 @@ from sqlalchemy import create_engine
 
 SCHEMA_PATH = Path(__file__).parent / "schema.json"
 
+# ---------------------------------------------------------------------------
+# Singleton engine — reuse the connection pool across all calls.
+# Creating a new engine on every get_engine() call means a new pool is spun
+# up and immediately torn down, negating all pooling benefits and hammering
+# the DB with connect/disconnect churn on every Streamlit widget interaction.
+# ---------------------------------------------------------------------------
+_engine = None
+
 
 def _dsn() -> str:
     url = os.environ.get("DATABASE_URL", "")
@@ -17,8 +25,16 @@ def _dsn() -> str:
 
 
 def get_engine():
-    """SQLAlchemy engine — used by pandas.read_sql."""
-    return create_engine(_dsn())
+    """Return the module-level singleton SQLAlchemy engine (with connection pool)."""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(
+            _dsn(),
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,   # discard stale connections silently
+        )
+    return _engine
 
 
 class _PgConn:
@@ -63,6 +79,14 @@ def init_db() -> None:
                 updated_at TEXT,
                 {field_defs}
             )
+        """)
+        # Idempotency guard: one row per source file.
+        # If two watcher runs overlap (e.g. GHA scheduled + manual dispatch
+        # before the concurrency group queuing takes effect), the second
+        # INSERT will silently skip rather than creating a duplicate row.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS interviews_source_file_uidx
+            ON interviews (source_file)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS syntheses (
