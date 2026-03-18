@@ -5,10 +5,20 @@ on:
     - cron: '0 21 * * *'   # 9:00 PM UTC every day
   workflow_dispatch:         # allow manual trigger from GitHub UI
 
+# Prevent two watcher runs overlapping — a second trigger queues behind the
+# first rather than running concurrently.  Overlapping runs would download the
+# same Drive files twice and write duplicate DB rows before either run archives.
+concurrency:
+  group: watcher-production
+  cancel-in-progress: false
+
 jobs:
   run-watcher:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Budget: up to 10 files × (5 min ACTIVE poll + 10 min transcription)
+    # = 150 min absolute worst case.  90 min covers the realistic batch size
+    # and is well within GitHub Actions' 6-hour hard limit.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repo

@@ -235,9 +235,59 @@ def _gemini_upload(client, local_path: Path, mime_type: str):
 # ---------------------------------------------------------------------------
 
 
+# Gemini Files API hard limits.
+GEMINI_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024   # 2 GB
+GEMINI_WARN_UPLOAD_BYTES = 500 * 1024 * 1024         # 500 MB — log a warning
+
+# MIME types that Gemini's Files API can process.  Anything not on this list
+# will be rejected by the API with an unhelpful error; better to catch it here.
+_GEMINI_SUPPORTED_MIME_PREFIXES = ("video/", "audio/", "image/", "text/")
+
+
 def detect_mime_type(file_path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(file_path))
-    return mime or "application/octet-stream"
+    if not mime:
+        # Common video extensions that mimetypes misses on some systems
+        ext = file_path.suffix.lower()
+        mime = {
+            ".mp4": "video/mp4",
+            ".mov": "video/quicktime",
+            ".avi": "video/x-msvideo",
+            ".mkv": "video/x-matroska",
+            ".webm": "video/webm",
+            ".m4a": "audio/mp4",
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".m4v": "video/x-m4v",
+        }.get(ext)
+    if not mime:
+        raise ValueError(
+            f"Cannot determine MIME type for '{file_path.name}'. "
+            "Rename the file with a standard extension (e.g. .mp4, .mov, .mp3) "
+            "or set mimeType explicitly."
+        )
+    if not any(mime.startswith(p) for p in _GEMINI_SUPPORTED_MIME_PREFIXES):
+        raise ValueError(
+            f"Unsupported MIME type '{mime}' for '{file_path.name}'. "
+            f"Gemini Files API only accepts: {_GEMINI_SUPPORTED_MIME_PREFIXES}"
+        )
+    return mime
+
+
+def _check_file_size(file_path: Path) -> None:
+    size = file_path.stat().st_size
+    if size > GEMINI_MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"'{file_path.name}' is {size / 1e9:.2f} GB, exceeding Gemini's "
+            "2 GB per-file limit. Split or compress the file before processing."
+        )
+    if size > GEMINI_WARN_UPLOAD_BYTES:
+        log.warning(
+            "[SIZE WARNING] %s is %.0f MB. Upload and ACTIVE polling may take "
+            "several minutes. Ensure the GHA job timeout is set high enough.",
+            file_path.name,
+            size / 1e6,
+        )
 
 
 def _wait_for_file_active(
@@ -324,6 +374,10 @@ def process_file(
 
     local_path = download_file(drive_service, file_id, file_name)
     size_mb = local_path.stat().st_size / (1024 * 1024)
+
+    # Validate before uploading — catch bad MIME types and oversized files
+    # immediately rather than burning Gemini quota on an unprocessable upload.
+    _check_file_size(local_path)
     mime_type = detect_mime_type(local_path)
     log.info("[DOWNLOADED] %s (%.1f MB, %s)", file_name, size_mb, mime_type)
 
@@ -337,10 +391,14 @@ def process_file(
     data = None
     try:
         _wait_for_file_active(gemini_client, uploaded)
+        # Explicit 20-minute HTTP timeout: long video transcription can take
+        # 10-15 minutes.  Without this the SDK uses its own default (which may
+        # be much shorter), causing a misleading timeout error mid-transcription.
         response = retry_with_backoff(
             lambda: gemini_client.models.generate_content(
                 model=gemini_model,
                 contents=[uploaded, prompt],
+                config={"http_options": {"timeout": 1200}},
             )
         )
         raw = response.text
@@ -373,12 +431,23 @@ def process_file(
     placeholders = ", ".join(["%s"] * len(columns))
     col_names = ", ".join(columns)
     with database.get_connection() as conn:
-        conn.execute(
-            f"INSERT INTO interviews ({col_names}) VALUES ({placeholders})",
+        cur = conn.execute(
+            # ON CONFLICT DO NOTHING: if two watcher runs somehow overlap
+            # (before the GHA concurrency group queues the second one), the
+            # second INSERT is silently skipped instead of creating a duplicate.
+            f"INSERT INTO interviews ({col_names}) VALUES ({placeholders}) "
+            "ON CONFLICT (source_file) DO NOTHING",
             values,
         )
         conn.commit()
-    log.info("[SAVED TO DB] %s", file_name)
+    if cur.rowcount == 0:
+        log.warning(
+            "[SKIPPED DB INSERT] %s already exists in interviews table — "
+            "possible duplicate watcher run. File will still be archived.",
+            file_name,
+        )
+    else:
+        log.info("[SAVED TO DB] %s", file_name)
 
     move_to_archive(drive_service, file_id, config["INBOX_FOLDER_ID"], config["ARCHIVE_FOLDER_ID"])
     log.info("[ARCHIVED] %s → archive", file_name)

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,14 +32,22 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 log = logging.getLogger(__name__)
 
 
+def _parse_retry_delay(exc: Exception) -> float | None:
+    """Extract the suggested retry delay from a 429 rate-limit error, if present."""
+    m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", str(exc), re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
+
 def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.0, **kwargs):
+    """Exponential backoff retry that also respects Gemini 429 retry-after delays."""
     last_exc = None
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            delay = base_delay * (2**attempt)
+            suggested = _parse_retry_delay(exc)
+            delay = max(base_delay * (2**attempt), suggested) if suggested else base_delay * (2**attempt)
             log.warning("Attempt %d/%d failed (%s). Retrying in %.1fs…", attempt + 1, max_retries, exc, delay)
             time.sleep(delay)
     raise last_exc
@@ -222,7 +231,16 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
     if st.button("Run Synthesis", disabled=st.session_state["synthesizing"]):
         st.session_state["synthesizing"] = True
         client = get_gemini_client()
-        rows_text = df.to_string(index=False)
+        # Limit synthesis to the 50 most recent interviews to stay well within
+        # Gemini's context window.  The transcript column alone can be 10-20 KB
+        # per row; 50 rows ≈ 500 KB of text, which is safe for Gemini 2.5 Flash.
+        synthesis_df = df.head(50)
+        if len(df) > 50:
+            st.info(
+                f"Synthesising the 50 most recent interviews out of {len(df)} total "
+                "(context-window limit). Use filters to target a specific cohort."
+            )
+        rows_text = synthesis_df.to_string(index=False)
         prompt = (
             "You are a senior UX researcher specialising in financial inclusion.\n"
             "Given the following interview data, produce:\n"
