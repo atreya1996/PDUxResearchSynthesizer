@@ -47,6 +47,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+
 def _load_env() -> dict:
     required = [
         "GOOGLE_SERVICE_ACCOUNT_JSON",
@@ -58,6 +61,8 @@ def _load_env() -> dict:
     missing = [k for k, v in config.items() if not v]
     if missing:
         raise EnvironmentError(f"Missing required env vars: {', '.join(missing)}")
+    config["GEMINI_MODEL"] = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    log.info("Using Gemini model: %s", config["GEMINI_MODEL"])
     return config
 
 
@@ -231,6 +236,7 @@ def process_file(
     schema: dict,
     config: dict,
     prompt: str,
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
 ) -> None:
     file_id = drive_file["id"]
     file_name = drive_file["name"]
@@ -247,7 +253,7 @@ def process_file(
     try:
         response = retry_with_backoff(
             lambda: gemini_client.models.generate_content(
-                model="gemini-1.5-pro",
+                model=gemini_model,
                 contents=[uploaded, prompt],
             )
         )
@@ -335,7 +341,15 @@ def run_watcher(
             log.info("Found %d file(s) in inbox.", len(files))
             for drive_file in files:
                 try:
-                    process_file(drive_service, drive_file, gemini_client, schema, config, prompt)
+                    process_file(
+                        drive_service,
+                        drive_file,
+                        gemini_client,
+                        schema,
+                        config,
+                        prompt,
+                        gemini_model=config["GEMINI_MODEL"],
+                    )
                     succeeded += 1
                 except Exception as exc:
                     log.error("[FAILED] %s: %s", drive_file.get("name"), exc, exc_info=True)
