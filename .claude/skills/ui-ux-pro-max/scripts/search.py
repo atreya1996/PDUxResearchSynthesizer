@@ -13,8 +13,6 @@ Install the full version:
   uipro init --ai claude
 """
 import argparse
-import sys
-
 
 DESIGN_SYSTEM_TEMPLATE = """
 ╔══════════════════════════════════════════════════════════════════════╗
