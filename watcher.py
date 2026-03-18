@@ -94,10 +94,17 @@ def build_prompt(schema: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+class DailyQuotaExhaustedError(Exception):
+    """Raised when the Gemini daily quota is exhausted.
+
+    The free tier allows 20 requests/day.  Once this is hit there is no point
+    retrying any further files in the same watcher run — the quota won't reset
+    for ~24 hours.  The watcher loop catches this and aborts immediately.
+    """
+
+
 def _parse_retry_delay(exc: Exception) -> float | None:
     """Extract the suggested retry delay (seconds) from a 429 error message, if present."""
-    import re
-
     msg = str(exc)
     m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", msg, re.IGNORECASE)
     if m:
@@ -105,19 +112,46 @@ def _parse_retry_delay(exc: Exception) -> float | None:
     return None
 
 
-def _is_retryable(exc: Exception) -> bool:
-    """Return False for permanent 4xx client errors that retrying can never fix.
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """True when the 429 is a non-recoverable daily/free-tier quota exhaustion.
 
-    Only 429 (rate-limit) among 4xx errors is transient.  Everything else
-    (400 INVALID_ARGUMENT, 401 Unauthorized, 403 Forbidden, 404 Not Found…)
-    is a hard configuration or input error — retrying just wastes time and
-    produces misleading log noise.
+    Distinguishes from transient per-minute rate limits by inspecting the
+    quotaId in the error payload.  Both the quota metric name and the
+    message text are checked so this works even if the API response format
+    changes slightly between SDK versions.
+    """
+    msg = str(exc)
+    return (
+        "PerDay" in msg
+        or "per_day" in msg
+        or "FreeTier" in msg
+        or "free_tier" in msg
+        or "GenerateRequestsPerDayPerProject" in msg
+    )
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return False for errors that retrying can never fix.
+
+    - 429 with daily/free-tier quota exhausted → not retryable (quota resets in ~24h)
+    - 429 with per-minute rate limit → retryable (honor retryDelay from API)
+    - All other 4xx (400, 401, 403, 404…) → not retryable (config/input errors)
+    - 5xx and network errors → retryable
     """
     try:
         from google.genai import errors as _genai_errors
 
         if isinstance(exc, _genai_errors.ClientError):
-            return getattr(exc, "status_code", 0) == 429
+            status_code = getattr(exc, "status_code", None)
+            # Normalise: SDK may store as int or string
+            try:
+                status_code = int(status_code)
+            except (TypeError, ValueError):
+                status_code = 0
+            if status_code == 429:
+                return not _is_daily_quota_error(exc)
+            # All other 4xx are hard errors
+            return False
     except ImportError:
         pass
     return True
@@ -130,14 +164,22 @@ def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.
             return func(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
+            if _is_daily_quota_error(exc):
+                # Re-raise as a special type so the watcher loop can abort
+                # all remaining files without attempting downloads.
+                raise DailyQuotaExhaustedError(
+                    "Gemini daily quota exhausted (free-tier limit reached). "
+                    "Remaining files will be skipped. Quota resets in ~24 hours."
+                ) from exc
             if not _is_retryable(exc):
                 log.error("Non-retryable error — will not retry: %s", exc)
                 raise
             suggested = _parse_retry_delay(exc)
-            delay = (
-                max(base_delay * (2**attempt), suggested)
-                if suggested
-                else base_delay * (2**attempt)
+            # Cap the suggested delay to 120 s so a misconfigured API doesn't
+            # stall the runner for an unreasonable amount of time.
+            delay = min(
+                max(base_delay * (2**attempt), suggested) if suggested else base_delay * (2**attempt),
+                120.0,
             )
             log.warning(
                 "Attempt %d/%d failed (%s). Retrying in %.1fs…",
@@ -381,18 +423,25 @@ def _write_gha_summary(total: int, succeeded: int, failed: list) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
+    skipped = [(n, e) for n, e in failed if "Skipped" in e]
+    errored = [(n, e) for n, e in failed if "Skipped" not in e]
     lines = [
         "## Watcher Run Summary\n",
         "| | Count |",
         "|---|---|",
         f"| Total files found | {total} |",
         f"| Processed successfully | {succeeded} |",
-        f"| Failed | {len(failed)} |",
+        f"| Errors | {len(errored)} |",
+        f"| Skipped (quota) | {len(skipped)} |",
     ]
-    if failed:
-        lines.append("\n### Failed files")
-        for name, err in failed:
+    if errored:
+        lines.append("\n### Errors")
+        for name, err in errored:
             lines.append(f"- `{name}`: {err}")
+    if skipped:
+        lines.append("\n### Skipped (daily quota exhausted)")
+        for name, _ in skipped:
+            lines.append(f"- `{name}`")
     with open(summary_path, "w") as f:
         f.write("\n".join(lines))
 
@@ -424,6 +473,20 @@ def run_watcher(
                         gemini_model=config["GEMINI_MODEL"],
                     )
                     succeeded += 1
+                except DailyQuotaExhaustedError as exc:
+                    log.error(
+                        "[QUOTA EXHAUSTED] %s — aborting run. %s",
+                        drive_file.get("name"),
+                        exc,
+                    )
+                    failed.append((drive_file.get("name"), str(exc)))
+                    # Mark every remaining file as skipped so the summary is accurate.
+                    remaining_idx = files.index(drive_file) + 1
+                    for skipped_file in files[remaining_idx:]:
+                        name = skipped_file.get("name", "(unknown)")
+                        log.warning("[SKIPPED] %s — daily quota already exhausted", name)
+                        failed.append((name, "Skipped — daily Gemini quota exhausted"))
+                    break
                 except Exception as exc:
                     log.error("[FAILED] %s: %s", drive_file.get("name"), exc, exc_info=True)
                     failed.append((drive_file.get("name"), str(exc)))
