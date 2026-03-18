@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +27,21 @@ LIST_FIELDS = {f["key"] for f in FIELDS if f["type"] == "list"}
 
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+log = logging.getLogger(__name__)
+
+
+def retry_with_backoff(func, *args, max_retries: int = 5, base_delay: float = 1.0, **kwargs):
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            delay = base_delay * (2**attempt)
+            log.warning("Attempt %d/%d failed (%s). Retrying in %.1fs…", attempt + 1, max_retries, exc, delay)
+            time.sleep(delay)
+    raise last_exc
 
 
 def get_gemini_client():
@@ -217,7 +234,9 @@ def view_macro_dashboard(df: pd.DataFrame) -> None:
         )
         with st.spinner("Generating personas and synthesis…"):
             try:
-                response = client.models.generate_content(model=get_gemini_model(), contents=prompt)
+                response = retry_with_backoff(
+                    lambda: client.models.generate_content(model=get_gemini_model(), contents=prompt)
+                )
                 content = response.text
                 now = datetime.now(timezone.utc).isoformat()
                 with database.get_connection() as conn:
@@ -362,8 +381,8 @@ def view_detail(interview_id: int) -> None:
             )
             with st.spinner("Re-extracting insights…"):
                 try:
-                    response = client.models.generate_content(
-                        model=get_gemini_model(), contents=prompt
+                    response = retry_with_backoff(
+                        lambda: client.models.generate_content(model=get_gemini_model(), contents=prompt)
                     )
                     data = json.loads(clean_json(response.text))
 
